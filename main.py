@@ -14,6 +14,7 @@ from src import (
     MovieUploadInfo,
     MovieDataResponse,
     MovieProcessingReport,
+    MovieCache
 )
 from data_pipeline import create_cleaning_report, process_data, validate_dataframe
 from src.storage import MOVIE_COLUMNS
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Movie API", version="1.0.0")
 app.middleware("http")(log_requests)
 storage = MovieStorage()
+cache = MovieCache()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -87,6 +89,7 @@ async def upload_movies(file: UploadFile = File(...)):
 
     # saves the movies in the database
     storage.save(df)
+    cache.invalidate()
 
     logger.info(
         "Uploaded movies: filename=%s, rows=%s",
@@ -103,9 +106,18 @@ async def upload_movies(file: UploadFile = File(...)):
     )
 
 
+
 @app.get("/movies", response_model=MovieDataResponse)
 def get_movies(limit: int = Query(default=100, ge=1)):
     """Return up to limit rows from the stored movies."""
+
+    # checks whether this response is already cached
+    cached_response = cache.get(limit)
+
+    # if the response is cached, return it without querying the database
+    if cached_response is not None:
+        logger.info("Returned cached movies: limit=%s", limit)
+        return cached_response
 
     # gets the selected movie rows from storage
     data = storage.select_columns(MOVIE_COLUMNS, limit)
@@ -113,15 +125,22 @@ def get_movies(limit: int = Query(default=100, ge=1)):
     # gets the total number of movies in the database
     total_rows = storage.count_movies()
 
+    # creates the complete response
+    response = {
+        "data": data,
+        "total_rows": total_rows
+    }
+
+    # saves the response in the cache for future requests
+    cache.set(limit, response)
+
     logger.info(
         "Retrieved movies: returned_rows=%s",
         len(data)
     )
 
-    return {
-        "data": data,
-        "total_rows": total_rows
-    }
+    return response
+
 
 
 @app.get("/movies/search", response_model=list[dict])
@@ -214,6 +233,7 @@ def process_movies(config: ProcessConfig):
 
     # save the processed movies only after the steps succeeded
     storage.save(processed_df)
+    cache.invalidate()
 
     logger.info(
         "Processed movies: validation_removed=%s, "
